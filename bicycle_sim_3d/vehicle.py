@@ -132,6 +132,139 @@ class ImperfectBicycleVehicle3D(BicycleVehicle3D):
         self.state = self._conform_to_terrain(np.array([x, y, z, roll, pitch, yaw]))
         self.prev_state = prev_state
         return prev_state, self.state.copy()
+    
+
+
+class SuspensionBicycleVehicle3D(BicycleVehicle3D):
+    """Kinematic bicycle model with a real second-order mass-spring-
+    damper response for roll/pitch, replacing the first-order lag.
+    Roll and pitch are now true dynamic states with their own rates
+    (self.roll_rate, self.pitch_rate), driven toward the
+    terrain-implied target angle by a damped-spring restoring torque.
+ 
+    This is the version whose causal direction actually matches what
+    ImuFactor assumes: real rotational dynamics producing the gyro
+    reading, rather than an algebraic snap (BicycleVehicle3D) or a
+    one-sided lag (the earlier fix) toward a target.
+ 
+    Uses omega_n (natural frequency, rad/s) and zeta (damping ratio) --
+    standard 2nd-order system parameters -- instead of raw spring/
+    damper constants, since they're more intuitive to tune:
+    zeta=1.0 is critically damped (fastest settle, no overshoot);
+    zeta<1 oscillates before settling; zeta>1 settles slower without
+    oscillating. Neither is derived from any real vehicle's actual
+    suspension -- pick values that look/feel reasonable and tune from
+    there.
+ 
+    STABILITY CAVEAT: uses semi-implicit (symplectic) Euler,
+    sub-stepped n_substeps times per outer dt -- not a single Euler
+    step at the full dt. This reduces instability risk but does not
+    eliminate it: push omega_n high enough relative to
+    dt/n_substeps and explicit integration can still oscillate or blow
+    up numerically, independent of the physical zeta you asked for. If
+    that happens, increase n_substeps first; the fully robust fix is an
+    exact analytic (matrix-exponential) discretization of the linear
+    2nd-order system, which is NOT implemented here -- this is a first
+    real pass at proper suspension dynamics, not a finished one.
+    """
+ 
+    def __init__(self, wheelbase, dt, terrain, state=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                 omega_n=2 * np.pi * 1.5, zeta=0.9, n_substeps=10):
+        """
+        omega_n: natural frequency in rad/s. 2*pi*1.5 (~1.5 Hz) here as
+            a placeholder in the range real vehicle suspensions often
+            sit in -- not measured from anything.
+        zeta: damping ratio, see class docstring.
+        n_substeps: sub-steps per outer dt for the semi-implicit Euler
+            integration -- see STABILITY CAVEAT above.
+        """
+        self.omega_n = omega_n
+        self.zeta = zeta
+        self.n_substeps = n_substeps
+        self.roll_rate = 0.0
+        self.pitch_rate = 0.0
+        super().__init__(wheelbase, dt, terrain, state)
+ 
+    def _conform_to_terrain(self, state):
+        """z still comes directly from terrain (no lag/dynamics there,
+        same as the base class) -- only roll/pitch get real 2nd-order
+        dynamics. roll/pitch coming in are the PREVIOUS values (this
+        method's calling convention, inherited from BicycleVehicle3D,
+        is that state carries the prior attitude forward).
+        """
+        x, y, _, roll, pitch, yaw = state
+        z = self.terrain.elevation(x, y)
+        dzdx, dzdy = self.terrain.gradient(x, y)
+ 
+        slope_fwd = dzdx * np.cos(yaw) + dzdy * np.sin(yaw)
+        slope_lat = -dzdx * np.sin(yaw) + dzdy * np.cos(yaw)
+        target_pitch = -np.arctan(slope_fwd)
+        target_roll = np.arctan(slope_lat)
+ 
+        sub_dt = self.dt / self.n_substeps
+        for _ in range(self.n_substeps):
+            roll_accel = (-self.omega_n ** 2 * (roll - target_roll)
+                          - 2 * self.zeta * self.omega_n * self.roll_rate)
+            pitch_accel = (-self.omega_n ** 2 * (pitch - target_pitch)
+                           - 2 * self.zeta * self.omega_n * self.pitch_rate)
+ 
+            # semi-implicit Euler: update rate first, then use the
+            # NEW rate to update position -- more stable than plain
+            # (explicit) Euler for oscillatory systems, though not
+            # unconditionally stable -- see STABILITY CAVEAT.
+            self.roll_rate += roll_accel * sub_dt
+            self.pitch_rate += pitch_accel * sub_dt
+            roll += self.roll_rate * sub_dt
+            pitch += self.pitch_rate * sub_dt
+ 
+        return np.array([x, y, z, roll, pitch, yaw])
+    
+
+
+class ImperfectSuspensionBicycleVehicle3D(SuspensionBicycleVehicle3D):
+    """Combines noisy planar actuation (see ImperfectBicycleVehicle3D)
+    with real 2nd-order roll/pitch suspension dynamics (see
+    SuspensionBicycleVehicle3D).
+ 
+    Deliberately does NOT follow ImperfectBicycleVehicle3D's pattern of
+    calling super().step() then re-conforming a second time -- that
+    would integrate the suspension ODE twice per outer dt (2*n_substeps
+    worth of dynamics instead of n_substeps), silently changing the
+    suspension's effective response speed. Instead this reimplements
+    the planar kinematics directly, adds noise, and calls
+    _conform_to_terrain exactly once.
+    """
+ 
+    def __init__(self, wheelbase, dt, terrain, state=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                 omega_n=2 * np.pi * 1.5, zeta=0.9, n_substeps=10,
+                 noise_std=(0.005, 0.005, 0.001)):
+        """noise_std: (x, y, yaw) standard deviations -- same convention
+        as ImperfectBicycleVehicle3D. omega_n/zeta/n_substeps: see
+        SuspensionBicycleVehicle3D.
+        """
+        super().__init__(wheelbase, dt, terrain, state, omega_n, zeta, n_substeps)
+        self.noise_std = noise_std
+ 
+    def step(self, v, delta):
+        prev_state = self.state.copy()
+        x, y, z, roll, pitch, yaw = self.state
+ 
+        x += v * np.cos(yaw) * self.dt
+        y += v * np.sin(yaw) * self.dt
+        yaw += (v / self.wheelbase) * np.tan(delta) * self.dt
+ 
+        x += np.random.normal(0, self.noise_std[0])
+        y += np.random.normal(0, self.noise_std[1])
+        yaw += np.random.normal(0, self.noise_std[2])
+ 
+        new_state = self._conform_to_terrain(np.array([x, y, z, roll, pitch, yaw]))
+ 
+        self.state = new_state
+        self.prev_state = prev_state
+        return prev_state, self.state.copy()
+    
+
+    
 
 
 def rotation_body_to_world(roll, pitch, yaw):

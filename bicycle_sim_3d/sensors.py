@@ -127,3 +127,31 @@ class ImuSensor(Sensor):
         accel_meas = accel_true + self.accel_bias + np.random.normal(0, self.accel_noise_std, size=3)
 
         return omega_meas, accel_meas
+    
+
+
+class GpsSensor(Sensor):
+    """Simulates GPS: a noisy absolute position measurement (x, y, z),
+    with STATIONARY noise -- unlike LidarOdometrySensor, error does not
+    accumulate over time. This is the sensor type a fixed-noise unary
+    factor was actually designed for.
+    """
+
+    def __init__(self, noise_std=(1.5, 1.5, 3.0), dt = 0.1, freq = 1):
+        """noise_std: (x, y, z) standard deviations, meters. Vertical is
+        typically worse than horizontal for real GPS -- these numbers
+        are placeholders, not from a real receiver's spec.
+        """
+        self.noise_std = noise_std
+
+        self.interval = max(1,round(1/freq/dt))
+        self.count = 0
+
+    def measure(self, vehicle, v, delta):
+        true_pos = vehicle.state[0:3]
+        self.count = (self.count + 1) % self.interval
+
+        if self.count == 0:
+            return true_pos + np.random.normal(0, self.noise_std, size=3)
+        else:
+            return None

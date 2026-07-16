@@ -9,26 +9,28 @@ import numpy as np
 
 class SimVisualizer:
     """Top-down (x, y) view of named trajectories, with an optional
-    terrain image drawn underneath, plus graphical gauges for yaw,
-    pitch, roll, and elevation.
+    terrain image drawn underneath, graphical gauges for yaw/pitch/
+    roll/elevation, and a row of error-over-time plots (position
+    distance + each angle) measured against a reference series.
 
-    Gauges are pre-created for every name in `series`, each colored to
-    match that series' trajectory line. Any series whose update() state
-    has 6 elements (x, y, z, roll, pitch, yaw) gets its gauges moved;
-    2-element (x, y)-only states are simply skipped for the gauges. This
-    means overlaying an estimator's attitude later is just a matter of
-    including it in `series` and passing a 6-element state for it --
-    no visualizer changes needed.
+    Gauges/error-lines are pre-created for every name in `series`, each
+    colored to match that series' trajectory line. Any series whose
+    update() state has 6 elements (x, y, z, roll, pitch, yaw) gets its
+    gauges/error moved; 2-element (x, y)-only states are skipped for
+    both. This means overlaying an estimator's attitude later is just a
+    matter of including it in `series` and passing a 6-element state
+    for it -- no visualizer changes needed.
 
     NOTE: the main plot only shows x, y -- it's a top-down position
     view, not a true 3D renderer.
     """
 
-    _STYLES = ['b-', 'r--', 'g--', 'm:', 'c-.', 'y:', 'k-']
+    _STYLES = ['b-', 'r--', 'g--', 'm:', 'c-.', 'y--', 'k-']
 
     def __init__(self, series, terrain=None,
                  xlim=(-5, 5), ylim=(-1, 9), marker_series=None,
-                 pitch_roll_range_deg=45.0, elevation_range=(0.0, 20.0)):
+                 pitch_roll_range_deg=45.0, elevation_range=(0.0, 20.0),
+                 error_reference_series=None):
         """
         terrain: a HeightmapTerrain instance (or anything with
             .heightmap, .resolution, .origin) to draw as a background.
@@ -44,12 +46,24 @@ class SimVisualizer:
         elevation_range: (min, max) the elevation bar gauge spans before
             clipping. Also a placeholder -- set it to your terrain's
             actual elevation range.
+        error_reference_series: name of the series treated as ground
+            truth for the error plots -- every other 6-element series
+            gets its position distance + |yaw|/|pitch|/|roll| error
+            (wrapped to (-180,180] before taking the absolute value)
+            plotted against it each step. Defaults to marker_series if
+            not given. None disables the error plots entirely. The
+            reference series itself is never plotted against itself
+            (always-zero line, not useful).
         """
         self.pitch_roll_range_deg = pitch_roll_range_deg
         self.elevation_range = elevation_range
+        self.error_reference = (
+            error_reference_series if error_reference_series is not None else marker_series
+        )
 
-        self.fig = plt.figure(figsize=(10, 6))
-        outer_gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 1])
+        self.fig = plt.figure(figsize=(11, 7.5))
+        outer_gs = self.fig.add_gridspec(2, 2, height_ratios=[2.2, 1], width_ratios=[3, 1],
+                                          hspace=0.4, wspace=0.3)
         self.ax = self.fig.add_subplot(outer_gs[0, 0])
         inner_gs = outer_gs[0, 1].subgridspec(4, 1, hspace=0.7)
         self.yaw_ax = self.fig.add_subplot(inner_gs[0, 0])
@@ -62,7 +76,7 @@ class SimVisualizer:
             ox, oy = terrain.origin
             extent = (ox, ox + cols * terrain.resolution,
                       oy, oy + rows * terrain.resolution)
-            im = self.ax.imshow(terrain.heightmap, cmap='terrain', origin='lower',
+            im = self.ax.imshow(terrain.heightmap, cmap='YlGn_r', origin='lower',
                                  extent=extent, zorder=0)
             self.fig.colorbar(im, ax=self.ax, label='elevation (m)', shrink=0.7)
 
@@ -93,8 +107,17 @@ class SimVisualizer:
 
         if marker_series is not None and marker_series not in self.lines:
             raise ValueError(f"marker_series '{marker_series}' not in series")
+        if self.error_reference is not None and self.error_reference not in self.lines:
+            raise ValueError(f"error_reference_series '{self.error_reference}' not in series")
 
-        self.ax.legend(loc='upper right')
+        # Legend moved off the trajectory plot -- lives above the whole
+        # figure instead of self.ax.legend(), so it never overlaps data.
+        self.fig.legend(
+            handles=list(self.lines.values()), labels=list(self.lines.keys()),
+            loc='upper center', bbox_to_anchor=(0.5, 1.0),
+            ncol=min(len(series), 6), fontsize=9, frameon=True,
+        )
+        self.fig.subplots_adjust(top=0.90)
 
         self._setup_yaw_gauge()
         self._setup_bar_gauge(self.pitch_ax, "UP", "DOWN", "Pitch")
@@ -115,6 +138,43 @@ class SimVisualizer:
             self.roll_markers[name] = rm
             em, = self.elev_ax.plot([0], [elevation_range[0]], marker='<', color=color, markersize=9, zorder=2)
             self.elev_markers[name] = em
+
+        # Error-over-time row
+        self.step_count = 0
+        self.time_steps = []
+        self.pos_error = {name: [] for name in series}
+        self.yaw_error = {name: [] for name in series}
+        self.pitch_error = {name: [] for name in series}
+        self.roll_error = {name: [] for name in series}
+        self.pos_error_lines = {}
+        self.yaw_error_lines = {}
+        self.pitch_error_lines = {}
+        self.roll_error_lines = {}
+
+        if self.error_reference is not None:
+            error_gs = outer_gs[1, :].subgridspec(1, 4, wspace=0.35)
+            self.pos_error_ax = self.fig.add_subplot(error_gs[0, 0])
+            self.yaw_error_ax = self.fig.add_subplot(error_gs[0, 1])
+            self.pitch_error_ax = self.fig.add_subplot(error_gs[0, 2])
+            self.roll_error_ax = self.fig.add_subplot(error_gs[0, 3])
+
+            self._setup_error_axis(self.pos_error_ax, "Position error", "m")
+            self._setup_error_axis(self.yaw_error_ax, "Yaw error", "deg")
+            self._setup_error_axis(self.pitch_error_ax, "Pitch error", "deg")
+            self._setup_error_axis(self.roll_error_ax, "Roll error", "deg")
+
+            for name in series:
+                if name == self.error_reference:
+                    continue
+                color = self.lines[name].get_color()
+                l, = self.pos_error_ax.plot([], [], '-', color=color, linewidth=1.3)
+                self.pos_error_lines[name] = l
+                l, = self.yaw_error_ax.plot([], [], '-', color=color, linewidth=1.3)
+                self.yaw_error_lines[name] = l
+                l, = self.pitch_error_ax.plot([], [], '-', color=color, linewidth=1.3)
+                self.pitch_error_lines[name] = l
+                l, = self.roll_error_ax.plot([], [], '-', color=color, linewidth=1.3)
+                self.roll_error_lines[name] = l
 
     def _setup_yaw_gauge(self):
         ax = self.yaw_ax
@@ -147,10 +207,27 @@ class SimVisualizer:
         ax.text(0, hi, f"{hi:g}m", ha='center', va='bottom', fontsize=8)
         ax.set_title("Elevation", fontsize=9)
 
+    def _setup_error_axis(self, ax, title, unit):
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("step", fontsize=8)
+        ax.set_ylabel(unit, fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.3)
+
+    @staticmethod
+    def _wrap_deg(angle_rad):
+        """Radians -> degrees, wrapped to (-180, 180]. Needed here (unlike
+        the gauges, which are periodic via sin/cos and never needed
+        this) because a raw angle difference near +/-180 would otherwise
+        show a fake huge error instead of a small wraparound one.
+        """
+        deg = np.degrees(angle_rad)
+        return (deg + 180) % 360 - 180
+
     def update(self, states):
         """states: dict mapping series name -> state. state[0:2] is
         (x, y); if len(state) == 6 it's (x, y, z, roll, pitch, yaw) and
-        the gauges for that series are updated too.
+        the gauges/error for that series are updated too.
         """
         artists = []
         for name, state in states.items():
@@ -181,11 +258,50 @@ class SimVisualizer:
                 self.elev_markers[name].set_data([0], [z_clipped])
                 artists.append(self.elev_markers[name])
 
+        if self.error_reference is not None and self.error_reference in states:
+            ref_state = states[self.error_reference]
+            if len(ref_state) == 6:
+                self.time_steps.append(self.step_count)
+                self.step_count += 1
+
+                for name, state in states.items():
+                    if name == self.error_reference or len(state) != 6:
+                        continue
+
+                    pos_err = np.linalg.norm(np.array(state[0:3]) - np.array(ref_state[0:3]))
+                    roll_err = abs(self._wrap_deg(state[3] - ref_state[3]))
+                    pitch_err = abs(self._wrap_deg(state[4] - ref_state[4]))
+                    yaw_err = abs(self._wrap_deg(state[5] - ref_state[5]))
+
+                    self.pos_error[name].append(pos_err)
+                    self.roll_error[name].append(roll_err)
+                    self.pitch_error[name].append(pitch_err)
+                    self.yaw_error[name].append(yaw_err)
+
+                    self.pos_error_lines[name].set_data(self.time_steps, self.pos_error[name])
+                    artists.append(self.pos_error_lines[name])
+                    self.yaw_error_lines[name].set_data(self.time_steps, self.yaw_error[name])
+                    artists.append(self.yaw_error_lines[name])
+                    self.pitch_error_lines[name].set_data(self.time_steps, self.pitch_error[name])
+                    artists.append(self.pitch_error_lines[name])
+                    self.roll_error_lines[name].set_data(self.time_steps, self.roll_error[name])
+                    artists.append(self.roll_error_lines[name])
+
+                # Growing time series need periodic rescaling -- axis
+                # limits changing under blit=True is a known-imperfect
+                # combination (matplotlib forces a fuller redraw of that
+                # axes when limits change), not pure blit performance.
+                # Untested on the real TkAgg backend (no display in my
+                # sandbox); watch for flicker/slowdown as the run grows.
+                for ax in (self.pos_error_ax, self.yaw_error_ax, self.pitch_error_ax, self.roll_error_ax):
+                    ax.relim()
+                    ax.autoscale_view()
+
         return artists
 
     def animate(self, step_fn, interval=50):
         """step_fn(frame) -> iterable of updated artists. Blocks until window closed."""
         self.ani = animation.FuncAnimation(
-            self.fig, step_fn, interval=interval, blit=True, cache_frame_data=False
+            self.fig, step_fn, interval=interval, blit=False, cache_frame_data=False
         )
         plt.show()
