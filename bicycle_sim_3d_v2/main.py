@@ -14,7 +14,7 @@ your machine, same as the rest of this module.
 import numpy as np
 
 from vehicle import ImperfectSuspensionBicycleVehicle3D
-from world import HeightmapTerrain
+from world import HeightmapTerrain, FlatTerrain
 from visualization import SimVisualizer
 
 from scheduler import EventScheduler, SensorStream
@@ -35,11 +35,15 @@ def main():
     np.random.seed(sim_cfg['run']['random_seed'])
 
     starting_state = tuple(sim_cfg['vehicle']['starting_state'])
-    terrain = HeightmapTerrain.from_image(
-        sim_cfg['terrain']['path'],
-        resolution=sim_cfg['terrain']['resolution'],
-        z_scale=sim_cfg['terrain']['max_elevation'],
-    )
+    terrain_cfg = sim_cfg['terrain']
+    if terrain_cfg['mode'] == 'flat':
+        terrain = FlatTerrain(elevation=terrain_cfg['flat_elevation'], resolution=terrain_cfg['resolution'])
+    elif terrain_cfg['mode'] == 'image':
+        terrain = HeightmapTerrain.from_image(
+            terrain_cfg['path'], resolution=terrain_cfg['resolution'], z_scale=terrain_cfg['max_elevation'],
+        )
+    else:
+        raise ValueError(f"terrain.mode must be 'flat' or 'image', got {terrain_cfg['mode']!r}")
     vehicle = ImperfectSuspensionBicycleVehicle3D(
         est_cfg['graph_reckoner']['wheelbase'], sim_cfg['vehicle']['fine_dt'], terrain,
         state=starting_state,
@@ -80,6 +84,7 @@ def main():
         lidar_drift_prior_std=tuple(gr_cfg['lidar_drift_prior_std']),
         lidar_drift_process_noise_std=tuple(gr_cfg['lidar_drift_process_noise_std']),
         residual_prop_noise_std=tuple(gr_cfg['residual_prop_noise_std']),
+        gps_prop_noise_std=tuple(gr_cfg['gps_prop_noise_std']),
         imu_configs=gr_cfg['imu_configs'],
         nhc_noise_std=tuple(gr_cfg['nhc_noise_std']),
         rate_prior_std=tuple(gr_cfg['rate_prior_std']),

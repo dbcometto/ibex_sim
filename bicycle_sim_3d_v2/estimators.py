@@ -101,7 +101,8 @@ class GraphReckoner:
                  rate_tie_noise_std=(0.01, 0.01),
                  gps_noise_std=(1.5, 1.5, 3.0),
                  lag_seconds=5.0,
-                 residual_prop_noise_std=(0.01, 0.01, 1.0, 1.0, 1.0, 0.01)):
+                 residual_prop_noise_std=(0.01, 0.01, 1.0, 1.0, 1.0, 0.01),
+                 gps_prop_noise_std=(0.5, 0.5, 0.5, 0.5, 0.5, 0.5)):
         """Parameter meanings match GraphReckoner in estimators.py --
         see that class's docstring. dyn_noise_std/rate_*_std were tuned
         there assuming a FIXED dt; since primaries now fire at whatever
@@ -141,6 +142,7 @@ class GraphReckoner:
         self.dyn_noise_std = dyn_noise_std
         self.dyn_noise = gtsam.noiseModel.Diagonal.Sigmas(_sigmas_xyzrpy_to_gtsam(dyn_noise_std))
         self.residual_prop_noise = gtsam.noiseModel.Diagonal.Sigmas(_sigmas_xyzrpy_to_gtsam(residual_prop_noise_std))
+        self.gps_prop_noise = gtsam.noiseModel.Diagonal.Sigmas(_sigmas_xyzrpy_to_gtsam(gps_prop_noise_std))
         self.nhc_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(nhc_noise_std))
         self.gps_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(gps_noise_std))
 
@@ -259,16 +261,35 @@ class GraphReckoner:
         self.initial = gtsam.Values()
         self.timestamps = gtsam_unstable.FixedLagSmootherKeyTimestampMap()
 
-    def _predict_dynamics(self, v, delta, dt):
-        """Same bicycle relative-motion model as estimators.py, but dt
-        is now a parameter instead of self.dt -- required since primary
-        and residual propagation intervals are no longer a fixed constant.
+    def _predict_dynamics(self, v, delta, dt, vz=0.0, roll_rate=0.0, pitch_rate=0.0):
+        """Same bicycle relative-motion model as before for (x, y, yaw),
+        but z/roll/pitch use constant-velocity/rate extrapolation instead
+        of always predicting zero change. vz/roll_rate/pitch_rate default
+        to 0.0, recovering the old constant-position behavior, if
+        velocity/rate aren't tracked.
+
+        dy is deliberately still hardcoded 0 (no lateral-slip term) --
+        an earlier attempt to extend the same treatment to lateral
+        velocity caused catastrophic divergence. Best-guess reason: z is
+        bounded/anchored by the terrain heightmap and corrected by
+        lidar's own z reading every cycle, so noise fed into vz can't
+        wander far; lateral (x/y) position has no equivalent anchor
+        besides periodic lidar/GPS corrections. Feeding a noisy vy_body
+        ESTIMATE into dyn_noise's tight (0.003) x/y sigma as a confident
+        deterministic input closes a feedback loop through the graph
+        itself -- any small persistent bias compounds every primary step
+        with nothing bounding it. Do not re-add without a much more
+        careful noise/stability analysis than z/roll/pitch needed.
+
+        CAVEAT: even the z/roll/pitch version here is a CONSTANT-rate
+        assumption over dt, not a real prediction of how rate itself
+        changes -- untested beyond "seemed to help a bit" so far.
         """
         dx = v * dt
         dy = 0.0
-        dz = 0.0
-        droll = 0.0
-        dpitch = 0.0
+        dz = vz * dt
+        droll = roll_rate * dt
+        dpitch = pitch_rate * dt
         dyaw = (v / self.wheelbase) * np.tan(delta) * dt
         return dx, dy, dz, droll, dpitch, dyaw
 
@@ -391,11 +412,32 @@ class GraphReckoner:
         if dt <= 0:
             raise ValueError(f"add_primary called with non-increasing time (dt={dt})")
 
-        dx, dy, dz, droll, dpitch, dyaw = self._predict_dynamics(v, delta, dt)
+        # Fetch the estimate BEFORE building the dynamics prediction --
+        # needed now to read the previous node's velocity/rate for the
+        # constant-velocity/rate extrapolation below. Nothing is solved
+        # between here and the second use of `est` later in this method,
+        # so one fetch covers both.
+        est = self.smoother.calculateEstimate()
+        prev_pose = est.atPose3(prev_key)
+
+        if self.uses_velocity:
+            v_world_prev = est.atVector(prev_vel_key)
+            R_prev = prev_pose.rotation().matrix()
+            v_body_prev = R_prev.T @ v_world_prev  # world -> prev's own body frame
+            vz_prev = v_body_prev[2]
+        else:
+            vz_prev = 0.0
+
+        if self.enable_rate:
+            r_prev_key_for_dyn = gtsam.symbol(S.RATE, self.pose_index - 1)  # matches prev_key's index
+            roll_rate_prev, pitch_rate_prev = est.atVector(r_prev_key_for_dyn)
+        else:
+            roll_rate_prev, pitch_rate_prev = 0.0, 0.0
+
+        dx, dy, dz, droll, dpitch, dyaw = self._predict_dynamics(
+            v, delta, dt, vz=vz_prev, roll_rate=roll_rate_prev, pitch_rate=pitch_rate_prev)
         dyn_pose = gtsam.Pose3(gtsam.Rot3.Ypr(dyaw, dpitch, droll), gtsam.Point3(dx, dy, dz))
         self.graph.add(gtsam.BetweenFactorPose3(prev_key, curr_key, dyn_pose, self.dyn_noise))
-
-        est = self.smoother.calculateEstimate()
 
         if self.enable_IMUs:
             for name in self.imu_names:
@@ -433,13 +475,14 @@ class GraphReckoner:
             dt_res = t - t_res
             if dt_res < 0:
                 raise ValueError(f"pending {kind} residual timestamp is after this primary's time")
-            ddx, ddy, ddz, ddroll, ddpitch, ddyaw = self._predict_dynamics(v, delta, dt_res)
+            ddx, ddy, ddz, ddroll, ddpitch, ddyaw = self._predict_dynamics(
+                v, delta, dt_res, vz=vz_prev, roll_rate=roll_rate_prev, pitch_rate=pitch_rate_prev)
             prop_pose = gtsam.Pose3(gtsam.Rot3.Ypr(ddyaw, ddpitch, ddroll), gtsam.Point3(ddx, ddy, ddz))
-            self.graph.add(gtsam.BetweenFactorPose3(res_key, curr_key, prop_pose, self.residual_prop_noise))
+            prop_noise = self.gps_prop_noise if kind == 'gps' else self.residual_prop_noise
+            self.graph.add(gtsam.BetweenFactorPose3(res_key, curr_key, prop_pose, prop_noise))
         self.pending_residuals = []
 
         # Initial guesses for the new primary pose/velocity
-        prev_pose = est.atPose3(prev_key)
         curr_pose_guess = prev_pose.compose(dyn_pose)
         self.initial.insert(curr_key, curr_pose_guess)
         self.timestamps.insert((curr_key, t))

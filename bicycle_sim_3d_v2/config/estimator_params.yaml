@@ -17,6 +17,31 @@
 primary_timer:
   period_s: 0.16667  # ~6 Hz -- shared by ROS timer and sim scheduler
 
+# ===== DEBUG LOG (flat-terrain tracking accuracy) =====
+# Symptom: on FLAT terrain (isolates away from the separate hill/
+# turning-lag issue -- see estimators.py's GraphReckoner docstring),
+# position error still dips to ~0.5m early then climbs slowly to
+# ~1.5-2m over the back half of a ~120s run. Not periodic, not
+# turning-correlated -- looks like a genuine accumulating bias/drift.
+#
+# Ruled out so far:
+# - gps_prop_noise_std loosened 0.01 -> 0.5: no meaningful change.
+#   In hindsight, expected -- this noise combines in QUADRATURE with
+#   GPS's own ~1.5m noise, which dominates regardless (sqrt(1.5^2+0.5^2)
+#   ~= sqrt(1.5^2+0.01^2) ~= 1.5m either way). Was likely a no-op, not
+#   a validated non-cause -- worth remembering it doesn't actually
+#   test "does the GPS link matter" the way it was intended to.
+# - lidar_drift_process_noise_std loosened 0.01/0.005 -> 0.03/0.01:
+#   made it WORSE. Rules out "drift chain too tight, real drift
+#   leaking into pose" as the explanation. Do NOT conclude the reverse
+#   (tighter is better) from this alone -- only tested one direction.
+#
+# Not yet tried: tightening lidar_drift_process_noise_std (opposite
+# direction from the failed test above); lag_seconds (fixed-lag window
+# length -- could be marginalizing evidence before full convergence);
+# isolating whether the climb is GPS-driven at all by disabling GPS
+# entirely (enable_gps: false) and comparing.
+
 topics:  # unused by the sim directly; kept here so the future ROS node
          # reads names from the same file as the tuning it pairs with
   lidar_odom: /ouster/odometry
@@ -51,6 +76,12 @@ graph_reckoner:
   # residual's correct orientation, not transmit it). Still an
   # untested guess on the exact numbers; tune from here.
   residual_prop_noise_std: [0.01, 0.01, 1.0, 1.0, 1.0, 0.01]
+
+  # Same idea, but for GPS residuals specifically -- GPS itself is only
+  # ~1.5m accurate, so transmitting it with lidar's tight noise would
+  # yank the pose toward a noisy reading with unwarranted confidence.
+  # Untested guess, same caveat as residual_prop_noise_std.
+  gps_prop_noise_std: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
   nhc_noise_std: [0.1, 0.1]
   rate_prior_std: [1.0, 1.0]
