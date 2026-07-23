@@ -1,0 +1,57 @@
+# Sim-only config. Nothing here is read by the (future) ROS node --
+# see estimator_params.yaml for the config shared between the two.
+
+terrain:
+  path: /home/dbcometto/workspace/ibex_sim/bicycle_sim_3d_v2/terrain_images/east_ridge.png
+  resolution: 0.1
+  max_elevation: 5.0
+
+vehicle:
+  fine_dt: 0.002  # truth integration substep -- must be << fastest sensor period
+  starting_state: [10.0, 10.0, 2.14, 0.0, -0.45, 0.0]  # x, y, z, roll, pitch, yaw
+  actuation_noise_std: [0.003, 0.003, 0.001]  # x, y, yaw -- see ImperfectSuspensionBicycleVehicle3D
+
+# NOTE: noise_std values below are the ACTUAL noise injected into
+# simulated readings -- deliberately separate from the estimator's
+# assumed noise_std in estimator_params.yaml. See that file's header
+# comment for why these are not linked.
+sensors:
+  lidar:
+    period_s: 0.125  # ~8 Hz
+    jitter_std_s: 0.005
+    dropout_prob: 0.02
+    noise_std: [0.0112, 0.0112, 0.0112, 0.000094, 0.000094, 0.000094]
+
+  gps:
+    period_s: 1.0
+    jitter_std_s: 0.02
+    dropout_prob: 0.05
+    noise_std: [1.5, 1.5, 3.0]
+
+  imu_ouster:
+    period_s: 0.005  # 200 Hz
+    jitter_std_s: 0.0  # IMUs are usually hardware-timed/regular; keep tight by default
+    dropout_prob: 0.0
+    gyro_noise_std: 0.001
+    accel_noise_std: 0.01
+    gyro_bias_walk_std: 0.00005
+    accel_bias_walk_std: 0.0001
+
+control:
+  v_leash: 1.0
+  delta_amplitude: 0.3
+  delta_period_s: 40.0  # matches old DELTA_PERIOD_STEPS * DT from main.py
+  leash_center: [12.8, 12.8]
+  leash_radius: 8.0
+
+run:
+  horizon_s: 120.0
+  random_seed: 0
+  # NOTE: events-per-frame is no longer configurable -- main.py now
+  # drains exactly one primary window (all lidar/gps/imu events inside
+  # it) per animation frame, so frame count tracks real sim time
+  # regardless of any sensor's rate.
+
+visualization:
+  xlim: [0, 25.6]
+  ylim: [0, 25.6]

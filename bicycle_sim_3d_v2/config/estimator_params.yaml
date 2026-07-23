@@ -1,0 +1,67 @@
+# Shared config for GraphReckoner tuning + topic names.
+#
+# This file is meant to be the SAME file the sim and the future ROS2
+# node both read -- anything here should be identical between them.
+# Sim-only concerns (terrain, jitter/dropout, visualization, control
+# input generation) live in sim_params.yaml instead.
+#
+# NOTE: the noise_std values under `graph_reckoner` are what the
+# ESTIMATOR BELIEVES about each sensor -- these are deliberately
+# duplicated (not shared/linked) with the ACTUAL injected noise in
+# sim_params.yaml, since in the real system the estimator's belief and
+# the sensor's true behavior are never literally the same object. If
+# you change one to match a real sensor spec, remember to check
+# whether the other should change too -- they will NOT update each
+# other automatically.
+
+primary_timer:
+  period_s: 0.16667  # ~6 Hz -- shared by ROS timer and sim scheduler
+
+topics:  # unused by the sim directly; kept here so the future ROS node
+         # reads names from the same file as the tuning it pairs with
+  lidar_odom: /ouster/odometry
+  gps: /gps/fix
+  imu_ouster: /ouster/imu
+  imu_insta: /insta360/imu
+
+graph_reckoner:
+  wheelbase: 1.0
+  prior_noise_std: 0.001
+  init_velocity_noise_std: 1.0
+  lag_seconds: 10.0
+
+  enable_lidar: true
+  enable_IMUs: true
+  enable_NHC: true
+  enable_rate: true
+  enable_gps: true
+
+  # (x, y, z, roll, pitch, yaw) order throughout, converted internally
+  # to gtsam's rotation-first tangent order.
+  dyn_noise_std: [0.003, 0.003, 1.0, 1.0, 1.0, 0.001]
+  lidar_noise_std: [0.0112, 0.0112, 0.0112, 0.000094, 0.000094, 0.000094]
+  lidar_drift_prior_std: [0.01, 0.01, 0.01, 0.005, 0.005, 0.005]
+  lidar_drift_process_noise_std: [0.01, 0.01, 0.01, 0.005, 0.005, 0.005]
+
+  # Noise for the residual-to-primary propagation factor -- see
+  # estimators.py's GraphReckoner docstring. Tight on x/y/yaw (transmit
+  # the residual's good info faithfully); loose on z/roll/pitch (the
+  # flat bicycle model predicts zero change there regardless, which is
+  # wrong on sloped terrain -- tightening those would fight the
+  # residual's correct orientation, not transmit it). Still an
+  # untested guess on the exact numbers; tune from here.
+  residual_prop_noise_std: [0.01, 0.01, 1.0, 1.0, 1.0, 0.01]
+
+  nhc_noise_std: [0.1, 0.1]
+  rate_prior_std: [1.0, 1.0]
+  rate_process_noise_std: [0.5, 0.5]
+  rate_tie_noise_std: [0.01, 0.01]
+  gps_noise_std: [1.5, 1.5, 3.0]
+
+  imu_configs:
+    imu_ouster:
+      gyro_noise_std: 0.001
+      accel_noise_std: 0.01
+      gyro_bias_walk_std: 0.00005
+      accel_bias_walk_std: 0.0001
+      integration_noise_std: 0.001
